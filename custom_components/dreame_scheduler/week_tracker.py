@@ -268,7 +268,7 @@ class WeekTracker:
         await self.async_save()
 
     async def async_set_last_run(self, summary: dict | None) -> None:
-        self._state["last_run"] = summary
+        self._state["last_run"] = {"map": self._active_map, **summary} if summary is not None else None
         await self.async_save()
 
     @property
@@ -282,7 +282,7 @@ class WeekTracker:
 
     async def async_append_history(self, entry: dict, cap: int = 200) -> None:
         hist = self.history
-        hist.append(entry)
+        hist.append({"map": self._active_map, **entry})
         if len(hist) > cap:          # keep only the most recent `cap` runs
             del hist[: len(hist) - cap]
         await self.async_save()
@@ -296,7 +296,7 @@ class WeekTracker:
         """Append a stuck/recovery event (where it wedged + context) for the
         recurring-trap learner. Capped; pure telemetry, no behaviour of its own."""
         evs = self.stuck_events
-        evs.append(event)
+        evs.append({"map": self._active_map, **event})
         if len(evs) > cap:
             del evs[: len(evs) - cap]
         await self.async_save()

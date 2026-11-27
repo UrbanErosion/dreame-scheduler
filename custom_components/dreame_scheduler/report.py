@@ -26,10 +26,21 @@ from homeassistant.util import dt as dt_util
 
 from . import history_analytics as hist_a
 from . import trap_learner
+from .floor_history import floor_scope
+from .room_roster import mapped_rooms
+from .scheduler import rooms_for_map
 from .const import (
     CONF_PREFIX,
     CONF_VACUUM_ENTITY,
+    DEFAULT_CATCHUP_DAY,
+    DEFAULT_CATCHUP_ENABLED,
+    DEFAULT_CATCHUP_TIME,
     DEFAULT_DAILY_TIME,
+    DEFAULT_OPPORTUNISTIC_CATCHUP,
+    DEFAULT_REQUIRE_AWAY,
+    DEFAULT_WINDOW_ENABLED,
+    DEFAULT_WINDOW_END,
+    DEFAULT_WINDOW_START,
     DOMAIN,
     MAX_SEGMENTS,
     OPT_CATCHUP_DAY,
@@ -38,6 +49,7 @@ from .const import (
     OPT_DAILY_TIME,
     OPT_DEFAULT_MODE,
     OPT_DEFAULT_SUCTION,
+    OPT_OPPORTUNISTIC_CATCHUP,
     OPT_REQUIRE_AWAY,
     OPT_ROOMS,
     OPT_WINDOW_ENABLED,
@@ -71,15 +83,6 @@ def _sval(hass: HomeAssistant, entity_id: str) -> str | None:
     return st.state
 
 
-def _room_names(hass: HomeAssistant, prefix: str) -> dict[str, str]:
-    names: dict[str, str] = {}
-    for n in range(1, MAX_SEGMENTS + 1):
-        name = _sval(hass, room_entity("select", prefix, n, "name"))
-        if name:
-            names[str(n)] = name
-    return names
-
-
 def _plain(v, _depth: int = 0):
     """Recursively coerce a value to plain JSON types. The dreame map camera
     stores some attribute values (obstacles) as objects that aren't dict/Mapping
@@ -110,8 +113,10 @@ def _map_attrs(hass: HomeAssistant, prefix: str) -> dict:
     st = hass.states.get(e("camera", prefix, "map"))
     if not st:
         return {}
-    plain = _plain(dict(st.attributes))
-    return plain if isinstance(plain, dict) else {}
+    # Maps can contain thousands of path points. Convert only report inputs.
+    keys = ("cleaning_history_picture", "entity_picture", "no_go_areas",
+            "obstacle_picture", "obstacles")
+    return {key: _plain(st.attributes[key]) for key in keys if key in st.attributes}
 
 
 def _coverage_runs(map_attrs: dict) -> list[dict]:
@@ -205,7 +210,16 @@ def _weekday_name(d) -> str | None:
     return WEEKDAYS[i] if 0 <= i < 7 else None
 
 
-def _schedule(hass: HomeAssistant, engine, opts: dict, rooms_cfg: dict, now: datetime) -> dict:
+def _is_today(stamp, now: datetime) -> bool:
+    """Compare aware timestamps in Home Assistant's local timezone."""
+    try:
+        when = datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return False
+    return when.tzinfo is not None and when.astimezone(now.tzinfo).date() == now.date()
+
+
+def _schedule(engine, opts: dict, now: datetime) -> dict:
     """Presence + next-run summary for the Presence card."""
     presence_home = engine._presence_home()
     configured = bool(engine._presence_entities())
@@ -214,22 +228,22 @@ def _schedule(hass: HomeAssistant, engine, opts: dict, rooms_cfg: dict, now: dat
     return {
         "presence_home": presence_home,          # True / False / None (unknown)
         "presence_configured": configured,
-        "require_away": bool(opts.get(OPT_REQUIRE_AWAY)),
+        "require_away": bool(opts.get(OPT_REQUIRE_AWAY, DEFAULT_REQUIRE_AWAY)),
         "daily_time": daily_time,
         "next_run": nxt.isoformat() if nxt else None,
         "next_run_day": WEEKDAYS[nxt.weekday()] if nxt else None,
         "next_run_time": nxt.strftime("%H:%M") if nxt else None,
         "window": {
-            "enabled": bool(opts.get(OPT_WINDOW_ENABLED)),
-            "start": opts.get(OPT_WINDOW_START),
-            "end": opts.get(OPT_WINDOW_END),
+            "enabled": bool(opts.get(OPT_WINDOW_ENABLED, DEFAULT_WINDOW_ENABLED)),
+            "start": opts.get(OPT_WINDOW_START, DEFAULT_WINDOW_START),
+            "end": opts.get(OPT_WINDOW_END, DEFAULT_WINDOW_END),
         },
         "catchup": {
-            "enabled": bool(opts.get(OPT_CATCHUP_ENABLED)),
+            "enabled": bool(opts.get(OPT_CATCHUP_ENABLED, DEFAULT_CATCHUP_ENABLED)),
             # the native options flow stores the day as a string ("5"), the
             # add-on as an int — accept both so the day always renders
-            "day": _weekday_name(opts.get(OPT_CATCHUP_DAY)),
-            "time": opts.get(OPT_CATCHUP_TIME),
+            "day": _weekday_name(opts.get(OPT_CATCHUP_DAY, DEFAULT_CATCHUP_DAY)),
+            "time": opts.get(OPT_CATCHUP_TIME, DEFAULT_CATCHUP_TIME),
         },
     }
 
@@ -238,9 +252,15 @@ def build_report(hass: HomeAssistant, entry: ConfigEntry, engine) -> dict:
     tracker = engine.tracker
     prefix = entry.data[CONF_PREFIX]
     opts = dict(entry.options)
-    rooms_cfg: dict = opts.get(OPT_ROOMS, {}) or {}
-    names = _room_names(hass, prefix)
-    map_attrs = _map_attrs(hass, prefix)
+    map_key = tracker.active_map
+    schedules = opts.get(OPT_ROOMS) or {}
+    rooms_cfg = rooms_for_map(schedules, map_key)
+    vacuum = hass.states.get(entry.data[CONF_VACUUM_ENTITY])
+    selected = hass.states.get(e("select", prefix, "selected_map"))
+    # A pinned run can still belong to a previously selected map.
+    scope = floor_scope(tracker, schedules, vacuum, selected)
+    map_attrs = _map_attrs(hass, prefix) if scope.live else {}
+    roster_names = mapped_rooms(vacuum, selected) if scope.live else {}
 
     now: datetime = dt_util.now()
     weekday = now.weekday()
@@ -257,21 +277,44 @@ def build_report(hass: HomeAssistant, entry: ConfigEntry, engine) -> dict:
         if o.get("type") == "Blocked Room" and o.get("room"):
             blocked_by_name[str(o["room"])] = o.get("reason") or "blocked"
 
-    history = list(getattr(tracker, "history", []) or [])
+    history = [row for row in tracker.history if scope.contains(row)]
+    cleaned_today = {seg for seg, stamp in cleaned.items() if _is_today(stamp, now)}
+    skipped_today = {}
+    for row in history:
+        if not _is_today(row.get("ts"), now):
+            continue
+        for seg, outcome in (row.get("per_room") or {}).items():
+            if outcome.get("status") == "cleaned":
+                cleaned_today.add(seg)
+            elif outcome.get("status") in ("failed", "skipped") and outcome.get("reason"):
+                skipped_today[seg] = outcome["reason"]
 
     rooms_out: list[dict] = []
     totals = {"cleaned": 0, "pending": 0, "skipped": 0, "not_scheduled": 0}
-    for n in range(1, MAX_SEGMENTS + 1):
-        seg = str(n)
-        name = names.get(seg)
-        if not name:
+    has_catchup = (opts.get(OPT_CATCHUP_ENABLED, DEFAULT_CATCHUP_ENABLED)
+                   or opts.get(OPT_OPPORTUNISTIC_CATCHUP, DEFAULT_OPPORTUNISTIC_CATCHUP))
+    # A configured or credited segment may have no name selector on this model.
+    configured_segments = rooms_cfg.keys() | cleaned.keys() | unreachable.keys()
+    segments = configured_segments | roster_names.keys()
+    if scope.live:
+        segments.update(str(n) for n in range(1, MAX_SEGMENTS + 1))
+    for seg in sorted((s for s in segments if isinstance(s, str) and s.isdecimal()),
+                      key=int):
+        cfg = rooms_cfg.get(seg)
+        configured = isinstance(cfg, dict)
+        cfg = cfg if configured else {}
+        name = _sval(hass, room_entity("select", prefix, seg, "name")) if scope.live else None
+        name = name or roster_names.get(seg)
+        if not name and seg not in configured_segments:
             continue
-        cfg = rooms_cfg.get(seg, {}) or {}
-        enabled = bool(cfg.get(ROOM_ENABLED, False))
-        days = list(cfg.get(ROOM_DAYS, []) or [])
+        name = name or cfg.get("name") or f"Room {seg}"
+        enabled = configured and bool(cfg.get(ROOM_ENABLED, True))
+        stored_days = cfg.get(ROOM_DAYS)
+        days = ([d for d in stored_days if type(d) is int and 0 <= d < 7]
+                if isinstance(stored_days, list) else [])
         mode = cfg.get(ROOM_MODE) or default_mode
         suction = cfg.get(ROOM_SUCTION) or default_suction
-        scheduled_week = enabled and bool(days)
+        scheduled_week = enabled and (bool(days) or has_catchup)
         scheduled_today = enabled and (weekday in days)
 
         if seg in cleaned:
@@ -289,13 +332,23 @@ def build_report(hass: HomeAssistant, entry: ConfigEntry, engine) -> dict:
 
         streak = hist_a.consecutive_fails(history, seg)
         sug = hist_a.suggest_better_day(history, seg, days)
+        if seg in cleaned_today:
+            status_today = "cleaned"
+        elif seg in skipped_today:
+            status_today = "skipped"
+        elif scheduled_today:
+            status_today = "pending"
+        else:
+            status_today = "not_scheduled"
         rooms_out.append({
             "seg": seg,
             "name": name,
             "enabled": enabled,
             "days": days,
-            "day_names": [WEEKDAYS[d] for d in days if 0 <= d < 7],
+            "day_names": [WEEKDAYS[d] for d in days],
             "scheduled_today": scheduled_today,
+            "status_today": status_today,
+            "blocked_reason_today": skipped_today.get(seg) if status_today == "skipped" else None,
             "mode": mode,
             "suction": suction,
             "status": status,
@@ -328,10 +381,11 @@ def build_report(hass: HomeAssistant, entry: ConfigEntry, engine) -> dict:
     # Recurring-trap learner: cluster the stuck-event log against the robot's
     # current no-go zones. Fixed traps (recurred across runs) become an apply-able
     # no-go suggestion; loose-object beachings become a tidy reminder.
-    stuck_events = list(getattr(tracker, "stuck_events", []) or [])
+    stuck_events = [event for event in tracker.stuck_events if scope.contains(event)]
     existing_zones = [engine._area_to_rect(z) for z in (map_attrs.get("no_go_areas") or [])]
     existing_zones = [z for z in existing_zones if z]
-    learn = trap_learner.analyze(stuck_events, existing_zones, room_boxes=engine._room_boxes_by_name())
+    room_boxes = engine._room_boxes_by_name() if stuck_events and scope.live else {}
+    learn = trap_learner.analyze(stuck_events if scope.live else [], existing_zones, room_boxes=room_boxes)
     promoted = dict(getattr(tracker, "learned_promoted", {}) or {})
     for s in learn["nogo_suggestions"]:
         if s["key"] in promoted:
@@ -370,6 +424,7 @@ def build_report(hass: HomeAssistant, entry: ConfigEntry, engine) -> dict:
         "prefix": prefix,
         "generated": now.isoformat(),
         "weekday": WEEKDAYS[weekday],
+        "map": map_key,
         "week_start": tracker.week_start,
         "rooms": rooms_out,
         "totals": totals,
@@ -389,7 +444,7 @@ def build_report(hass: HomeAssistant, entry: ConfigEntry, engine) -> dict:
         # Raw run log (capped in the tracker) — powers the GUI's run-history
         # timeline + weekday trend. _plain() keeps it JSON-safe.
         "history": [_plain(h) for h in history[-100:]],
-        "last_run": tracker.last_run,
+        "last_run": tracker.last_run if scope.contains(tracker.last_run) else None,
         "coverage": {
             "live_map_url": map_attrs.get("entity_picture"),
             "runs": _coverage_runs(map_attrs),
@@ -397,7 +452,7 @@ def build_report(hass: HomeAssistant, entry: ConfigEntry, engine) -> dict:
         "obstacles": obstacles,
         "cleaned_area_today": _sval(hass, e("sensor", prefix, "cleaned_area")),
         "robot": _robot(hass, engine, prefix),
-        "schedule": _schedule(hass, engine, opts, rooms_cfg, now),
+        "schedule": _schedule(engine, opts, now),
         "weekdays": WEEKDAYS,
     }
 
