@@ -27,6 +27,7 @@ from homeassistant.helpers.event import (
 )
 from homeassistant.util import dt as dt_util
 
+from . import room_credit
 from . import clean_guards, clean_window, history_analytics as hist_a, trap_learner
 from .const import (
     CONF_PREFIX,
@@ -176,6 +177,7 @@ from .run_resume import resume_with_start, stuck_flag_on_pause_change, task_word
 from .parked_fault import fault_fix, parked_fault, plan as parked_fault_plan
 from .room_roster import mapped_rooms
 from .scheduler import (
+    DEFAULT_MAP_KEY,
     advance_mop_cadence,
     active_map_key,
     is_flat_rooms,
@@ -2465,23 +2467,13 @@ class SchedulerEngine:
 
     @callback
     def _handle_state_event(self, event: Event) -> None:
-        # Accumulate visited rooms while a run is in flight, then re-evaluate.
         run = self.tracker.active_run
-        if run is not None and event.data.get("entity_id") == entity_of(
-            "sensor", self._prefix, "current_room"
-        ):
-            new = event.data.get("new_state")
-            if new is not None and str(new.state).lower() not in _UNAVAILABLE:
-                visited = run.setdefault("visited", [])
-                if new.state not in visited:
-                    visited.append(new.state)
-                    # Persist — otherwise a Store reload (e.g. options update)
-                    # drops the in-flight visited list, and it's the fallback
-                    # signal for crediting a room on an abnormal end.
-                    self.hass.async_create_task(self._persist_visited(run))
+        if run and event.data.get("entity_id") == self._vacuum_entity:
+            if room_credit.observe(run, event.data.get("old_state"), event.data.get("new_state")):
+                self.hass.async_create_task(self._persist_room_evidence(run))
         self.hass.async_create_task(self._tick())
 
-    async def _persist_visited(self, run: dict) -> None:
+    async def _persist_room_evidence(self, run: dict) -> None:
         # Queued from a state event: by the time this executes the run may have
         # been finalised — writing it back then RESURRECTS a finished run, which
         # the next tick re-finalises (duplicate history + double room banking).
@@ -2998,7 +2990,7 @@ class SchedulerEngine:
             "started": now.isoformat(),
             "count_at_start": self._cleaning_count(),
             "record_ts_at_start": self._newest_record_ts(),
-            "visited": [],
+            "room_job": {"phase": "preparing"},
             "seen_active": False,
             "notified_stuck": False,
         })
@@ -3078,6 +3070,15 @@ class SchedulerEngine:
                 await self.tracker.async_set_active_run(run)
 
         int_segments = [int(s) for s in segments if str(s).isdigit()]
+        run = self.tracker.active_run
+        vacuum = self.hass.states.get(self._vacuum_entity)
+        attrs = vacuum.attributes if vacuum else {}
+        map_id = room_credit.numeric_id(attrs.get("selected_map_id"))
+        floor, multi_floor = room_credit.floor_identity(attrs, run.get("map", DEFAULT_MAP_KEY))
+        run["room_job"] = {"command_at": dt_util.now().timestamp(), "map_id": map_id,
+                           "floor": floor, "multi_floor": multi_floor,
+                           "phase": "waiting" if attrs.get("started") is False else "ended"}
+        await self.tracker.async_set_active_run(run)
         await self._send_clean_segment(int_segments)
         self._set_status("running", f"{kind}: cleaning {', '.join(seg_names.values())}")
         _LOGGER.info("dreame_scheduler: dispatched %s clean of segments %s", kind, int_segments)
@@ -3476,60 +3477,57 @@ class SchedulerEngine:
         # Safety net: never leave the speaker muted if a run ended mid-maneuver.
         await self._restore_voice(run)
 
-        # blocked_rooms from the completion record is the map-derived truth of
-        # what couldn't be reached (door/obstacle), keyed by segment id.
-        blocked_reasons: dict[str, str] = {}
-        if record and isinstance(record.get("blocked_rooms"), dict):
-            blocked_reasons = {str(k): v for k, v in record["blocked_rooms"].items()}
-        blocked = set(blocked_reasons)
-
-        # A room is banked as cleaned only when we can TRUST it — never from the
-        # robot's "Task completed" text (it reports that even on a manual return-
-        # to-base). We trust: a normal, error-free, non-interrupted full pass
-        # (rooms not in the map's blocked list), or a room we actually saw the
-        # robot enter. An aborted / errored / interrupted run credits only what
-        # we can confirm; everything else stays pending and gets retried.
-        cleaned, skipped = [], []
-        visited = set(run.get("visited", []))
-        error_active = self._error_active()
-        # Area sanity: a run that swept an implausibly small total area didn't
-        # really clean, even if the record says "completed" (e.g. it left the
-        # dock, cleaned ~1 sq m, and returned). Don't bank rooms on the trusted-
-        # pass path in that case; require we actually saw the robot enter them.
-        run_area = _parse_area(record.get("cleaned_area") if record else None)
-        too_small = run_area is not None and run_area < max(1.0, len(targets) * MIN_AREA_PER_ROOM_M2)
-        if too_small:
-            _LOGGER.debug("run swept only %.1f sq m for %d rooms; not crediting the trusted-pass path", run_area, len(targets))
+        job = run.get("room_job") or {}
+        started = _parse_iso(run.get("started"))
+        command_at = job.get("command_at") if job else (started.timestamp() if started else None)
+        vacuum = self.hass.states.get(self._vacuum_entity)
+        attrs = vacuum.attributes if vacuum else {}
+        floor, multi_floor = room_credit.floor_identity(attrs, run.get("map", DEFAULT_MAP_KEY))
+        current_map = attrs.get("selected_map_id")
+        changed_floor = ((job.get("map_id") is not None and current_map is not None
+                          and job["map_id"] != str(current_map)) or (job.get("floor") and job["floor"] != floor))
+        needs_floor_id = multi_floor or job.get("multi_floor") or changed_floor
+        record = room_credit.matched_record(run, record, command_at, now.timestamp(), job.get("floor", floor), needs_floor_id)
+        blocked_raw = record.get("blocked_rooms")
+        blocked_reasons = {str(k): v for k, v in blocked_raw.items()} if isinstance(blocked_raw, dict) else {}
+        blocked = room_credit.segment_ids(blocked_raw)
+        skipped_ids = room_credit.segment_ids(record.get("skipped_rooms"))
+        known_exclusions = blocked is not None and skipped_ids is not None
+        excluded = (blocked or set()) | (skipped_ids or set()) | set(job.get("excluded", ()))
+        completed_ids = room_credit.segment_ids(record.get("completed_segments"))
+        cleaned_ids = room_credit.segment_ids(record.get("cleaned_segments"))
+        reported = set(job.get("rooms", ())) | (completed_ids or set())
+        completed = (not interrupted and record.get("completed") is True and not record.get("interrupt_reason")
+                     and not self._error_active() and not run.get("errored"))
+        if completed:
+            reported |= cleaned_ids or set()
+        run_area = _parse_area(record.get("cleaned_area"))
+        single_target = (completed and len(targets) == 1 and (run_area is None or run_area >= MIN_AREA_PER_ROOM_M2)
+                         and all(ids is not None and ids.issubset(targets) for ids in
+                                 (completed_ids, cleaned_ids, room_credit.segment_ids(record.get("active_segments")))))
+        cleaned, skipped, unverified = [], [], []
         for seg in targets:
-            name = seg_names.get(seg)
-            seen = bool(visited and name and name in visited)
-            if failed_start:
+            if failed_start or seg in excluded:
                 skipped.append(seg)
-            elif seg in blocked:
-                skipped.append(seg)                     # map says door/obstacle
-            elif interrupted:
-                (cleaned if seen else skipped).append(seg)
-            elif (record is not None and record.get("completed") is not False
-                    and not error_active and not run.get("errored") and not too_small):
-                cleaned.append(seg)                     # trusted full pass
-            elif seen:
-                cleaned.append(seg)                     # abnormal end, but seen
+            elif known_exclusions and (seg in reported or single_target):
+                cleaned.append(seg)
             else:
-                skipped.append(seg)                     # unconfirmed -> pending
+                unverified.append(seg)
 
         if cleaned:
             await self.tracker.async_mark_cleaned(cleaned, ts)
 
         # Interrupted: the un-done rooms are deferred, not failures — queue them.
         if interrupted:
-            if skipped and bool(self._opt(OPT_RESUME_WHEN_AWAY, DEFAULT_RESUME_WHEN_AWAY)):
+            remaining = [seg for seg in targets if seg not in cleaned]
+            if remaining and bool(self._opt(OPT_RESUME_WHEN_AWAY, DEFAULT_RESUME_WHEN_AWAY)):
                 await self.tracker.async_set_resume(
-                    {"segments": skipped, "kind": run.get("kind", "daily")}
+                    {"segments": remaining, "kind": run.get("kind", "daily")}
                 )
             await self.tracker.async_set_last_run({
                 "kind": run.get("kind"), "finished": ts, "interrupted": True,
                 "cleaned": [seg_names.get(s, s) for s in cleaned],
-                "remaining": [seg_names.get(s, s) for s in skipped],
+                "remaining": [seg_names.get(s, s) for s in remaining],
             })
             await self.tracker.async_set_active_run(None)
             self._set_status("waiting", "paused (someone home) — will resume when empty")
@@ -3549,13 +3547,16 @@ class SchedulerEngine:
                     "Skipped " + ", ".join(parts) + " — kept pending for the weekly catch-up.",
                 )
 
-        area = record.get("cleaned_area") if record else None
-        await self.tracker.async_set_last_run({
+        area = record.get("cleaned_area")
+        summary = {
             "kind": run["kind"], "finished": ts,
             "cleaned": [seg_names.get(s, s) for s in cleaned],
             "skipped": [seg_names.get(s, s) for s in skipped],
             "cleaned_area": area,
-        })
+        }
+        if unverified:
+            summary["unverified"] = [seg_names.get(s, s) for s in unverified]
+        await self.tracker.async_set_last_run(summary)
 
         # Append to the run-history log (fail-trend / weekday analytics). Only
         # normal ends are logged — interrupted runs returned above, so a room
