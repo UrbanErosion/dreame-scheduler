@@ -177,6 +177,7 @@ from .parked_fault import fault_fix, parked_fault, plan as parked_fault_plan
 from .scheduler import (
     advance_mop_cadence,
     active_map_key,
+    is_flat_rooms,
     rooms_for_map,
     all_enabled_segments,
     choose_dispatch,
@@ -3588,34 +3589,56 @@ class SchedulerEngine:
         # First-ever rollover (no previous week recorded) — nothing to report.
         if not summary.get("week_start"):
             return
-        rooms = self._rooms()
-        all_segs = all_enabled_segments(rooms)
-        done = set((summary.get("cleaned") or {}).keys())
-        missed = [s for s in all_segs if s not in done]
-        if not all_segs:
+        configured = self._opt(OPT_ROOMS, {}) or {}
+        selected = active_map_key(self._sval(entity_of("select", self._prefix, "selected_map")))
+        # A flat legacy roster has no floor identity. Its configured room names
+        # and targets are valid only for the currently selected map.
+        schedules = {selected: configured} if is_flat_rooms(configured) else configured
+        outcomes = summary["maps"]
+        lines = {}
+        for floor, rooms in schedules.items():
+            if not isinstance(rooms, dict):
+                continue
+            targets = all_enabled_segments(rooms)
+            if not targets:
+                continue
+            outcome = outcomes.get(floor, {})
+            cleaned = outcome.get("cleaned", {})
+            blocked = outcome.get("unreachable", {})
+            missed = []
+            for seg in targets:
+                if seg in cleaned:
+                    continue
+                # Dreame's live room-name entities follow the selected map.
+                name = (self._room_name(seg) if floor == selected
+                        else rooms[seg].get("name") or f"Room {seg}")
+                count = int(blocked.get(seg, 0))
+                missed.append(f"{name} ({count}× blocked)" if count else name)
+            if missed:
+                done = len(targets) - len(missed)
+                lines[floor] = (f"{done}/{len(targets)} rooms cleaned this week. "
+                                f"Never finished: {', '.join(missed)}.")
+            else:
+                lines[floor] = f"✅ All {len(targets)} rooms were cleaned at least once this week."
+
+        if not lines:
             return
-        n_done = len(all_segs) - len(missed)
-        if missed:
-            # Fail counts for the finished week (snapshot taken before reset), so
-            # "why" context is week-accurate without touching the map camera.
-            unreach = summary.get("unreachable") or {}
+        for floor, outcome in outcomes.items():
+            if floor in schedules:
+                continue
+            # Evidence from a previously visited floor survives even when its
+            # configured roster is unavailable. No denominator can be inferred.
+            confirmed = len(outcome["cleaned"])
+            blocked = len(outcome["unreachable"])
+            if confirmed or blocked:
+                lines[floor] = (f"Room records show {confirmed} confirmed and {blocked} with blocked attempts. "
+                                "No room schedule available.")
 
-            def _line(seg: str) -> str:
-                name = self._room_name(seg)
-                c = int(unreach.get(seg, 0))
-                return f"{name} ({c}× blocked)" if c else name
-
-            names = ", ".join(_line(s) for s in missed)
-            await self._notify(
-                "Weekly vacuum summary",
-                f"{n_done}/{len(all_segs)} rooms cleaned this week. "
-                f"Never finished: {names}.",
-            )
+        if len(lines) == 1 and selected in lines:
+            message = lines[selected]
         else:
-            await self._notify(
-                "Weekly vacuum summary",
-                f"✅ All {len(all_segs)} rooms were cleaned at least once this week.",
-            )
+            message = "\n".join(f"{floor} — {line}" for floor, line in lines.items())
+        await self._notify("Weekly vacuum summary", message)
 
     async def _maybe_surface_learned(self, now: datetime) -> None:
         """After a run, run the recurring-trap learner over the stuck-event log

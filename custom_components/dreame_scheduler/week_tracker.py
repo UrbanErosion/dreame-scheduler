@@ -154,25 +154,16 @@ class WeekTracker:
         return self._map().setdefault("unreachable", {})
 
     async def async_reset_week(self, new_week_start: str) -> dict:
-        """Snapshot the finishing week's outcome (aggregated across every map),
-        then clear the per-map week counters. Returns the previous week's summary
-        for the weekly notice. The week anchor is house-wide (top-level)."""
-        agg_cleaned: dict = {}
-        agg_unreachable: dict = {}
-        for slot in self._state.get("maps", {}).values():
-            if not isinstance(slot, dict):
-                continue
-            agg_cleaned.update(slot.get("cleaned") or {})
-            agg_unreachable.update(slot.get("unreachable") or {})
-        summary = {
-            "week_start": self._state.get("week_start"),
-            "cleaned": agg_cleaned,
-            "unreachable": agg_unreachable,
-        }
+        """Snapshot each floor before clearing its weekly counters."""
+        summary = {"week_start": self.week_start, "maps": {}}
         self._state["week_start"] = new_week_start
-        for slot in self._state.get("maps", {}).values():
+        for key, slot in self._state.get("maps", {}).items():
             if not isinstance(slot, dict):
                 continue
+            summary["maps"][key] = {
+                "cleaned": slot.get("cleaned") or {},
+                "unreachable": slot.get("unreachable") or {},
+            }
             slot["cleaned"] = {}
             slot["unreachable"] = {}
             slot["day_dispatched"] = None
