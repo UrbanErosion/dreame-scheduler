@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Dreame Scheduler card checks</title>
+  <style>
+    :root { color-scheme:light; --primary-color:#176a65; --primary-text-color:#20343c; --secondary-text-color:#475d67;
+      --divider-color:#b2c6cb; --card-background-color:#fff; --secondary-background-color:#eef4f4; --backdrop:#eef3f4; }
+    @media (prefers-color-scheme: dark) {
+      :root { color-scheme:dark; --primary-color:#87dbcd; --primary-text-color:#e9f2f7; --secondary-text-color:#aec5cf;
+        --divider-color:#46616f; --card-background-color:#142936; --secondary-background-color:#203944; --backdrop:#0b1c26; }
+    }
+    body { background:var(--backdrop); color:var(--primary-text-color);
+      max-width:600px; margin:0 auto; padding:12px; font:16px/1.4 Arial,sans-serif; }
+    ha-card { display:block; background:var(--card-background-color); border-radius:16px; }
+    [data-result] { display:block; margin:20px 0; }
+  </style>
+  <script defer src="../www/dreame-scheduler-card.js"></script>
+</head>
+<body>
+<dreame-scheduler-card></dreame-scheduler-card>
+<output data-result="pending"></output>
+<script>
+window.addEventListener("DOMContentLoaded", () => {
+  const result = document.querySelector("output");
+  const card = document.querySelector("dreame-scheduler-card");
+  const get = selector => card.querySelector(selector);
+  const config = {entity:"sensor.upstairs_scheduler_status", vacuum_entity:"vacuum.upstairs", title:"Floor care"};
+  const state = (value, attributes = {}) => ({state:value, attributes});
+  const attrs = {reason:"Waiting for the house to be empty", cleaned_rooms:["Kitchen","Hall"],
+    pending_rooms:["Dining room","Office"], missed_rooms:{"Office":1},
+    last_run:{interrupted:true, cleaned:["Kitchen"], cleaned_area:"13 m²"}};
+  const states = {
+    [config.entity]:state("waiting", attrs),
+    "switch.upstairs_scheduler_scheduler_enabled":state("on"),
+    "button.upstairs_scheduler_run_today_s_schedule_now":state("unknown"),
+    "button.upstairs_scheduler_clean_now":state("unknown"),
+    "button.upstairs_scheduler_clean_now_quiet":state("unknown"),
+    "button.upstairs_scheduler_reset_week_counters":state("unknown"),
+    "vacuum.upstairs":state("docked", {supported_features:16}),
+    "vacuum.downstairs":state("cleaning", {supported_features:16})
+  };
+  const calls = [];
+  const refresh = () => { card.hass = {states:{...states}, callService:(...args) => calls.push(args)}; };
+  function check(ok, message) { if (!ok) throw Error(message); }
+  function clicked(action) { get('[data-action="' + action + '"]').click(); }
+  function callIs(domain, service, id) {
+    return JSON.stringify(calls[calls.length - 1]) === JSON.stringify([domain, service, {entity_id:id}]);
+  }
+  try {
+    card.setConfig(config);
+    refresh();
+    check(get(".dsc-count").textContent === "2 of 4 rooms credited", "Counts available from the status entity alone");
+    check(get(".dsc-last").textContent.includes("Interrupted · 1 room credited · 13 m²"), "Recorded last-run outcome");
+    check(get('[data-action="dock"]').hidden, "Docked robot does not offer a return command");
+    clicked("run_today");
+    check(callIs("button","press","button.upstairs_scheduler_run_today_s_schedule_now"), "Run scoped to upstairs");
+    clicked("clean_now");
+    check(callIs("button","press","button.upstairs_scheduler_clean_now"), "Pending targets catch-up");
+    clicked("clean_quiet");
+    check(callIs("button","press","button.upstairs_scheduler_clean_now_quiet"), "Quiet targets quiet catch-up");
+    const oldConfirm = window.confirm;
+    window.confirm = () => false;
+    clicked("reset_week");
+    check(calls.length === 3, "Cancelled reset does nothing");
+    window.confirm = () => true;
+    clicked("reset_week");
+    check(callIs("button","press","button.upstairs_scheduler_reset_week_counters"), "Reset scoped to upstairs");
+    window.confirm = oldConfirm;
+    get("[data-en]").click();
+    check(callIs("switch","turn_off","switch.upstairs_scheduler_scheduler_enabled"), "Toggle targets its own switch");
+
+    const summary = get("summary");
+    summary.focus();
+    summary.click();
+    const oldRow = get(".dsc-rooms li");
+    states["sensor.unrelated"] = state("updated");
+    refresh();
+    check(oldRow === get(".dsc-rooms li"), "Unrelated updates keep existing room elements");
+    states[config.entity] = state("running", {...attrs, cleaned_rooms:["Kitchen","<Laundry>","Loft"], pending_rooms:["Office"]});
+    refresh();
+    check(get("details").open && summary === document.activeElement, "Live changes preserve disclosure and keyboard focus");
+    check([...card.querySelectorAll(".dsc-rooms li")].some(row => row.textContent === "<Laundry>"), "Room names are plain text");
+    check(!get("laundry") && get(".dsc-count").textContent === "3 of 4 rooms credited", "Fresh names and counts");
+    states["vacuum.upstairs"] = state("cleaning", {supported_features:16});
+    refresh();
+    clicked("dock");
+    check(callIs("vacuum","return_to_base","vacuum.upstairs") && calls.length === 6, "Only the explicitly configured robot docks");
+    states["vacuum.upstairs"] = state("cleaning", {supported_features:0});
+    refresh();
+    check(get('[data-action="dock"]').hidden, "Unsupported dock command hidden");
+    card.setConfig({entity:config.entity});
+    check(get('[data-action="dock"]').hidden, "One-entity configs never infer another robot");
+    states[config.entity] = state("idle");
+    states["sensor.upstairs_scheduler_rooms_cleaned_this_week"] = state("1", {rooms_total:4});
+    refresh();
+    check(get(".dsc-count").textContent === "1 of 4 rooms credited", "Legacy aggregate sensor");
+    delete states[config.entity];
+    refresh();
+    check(get(".dsc-count").textContent === "Room totals unavailable" && get('[data-action="run_today"]').disabled,
+          "Missing status leaves actions disabled and coverage unknown");
+    states[config.entity] = state("idle", {cleaned_rooms:[], pending_rooms:[]});
+    refresh();
+    check(get(".dsc-count").textContent === "No rooms scheduled", "Empty roster differs from unknown");
+    states[config.entity] = state("waiting", attrs);
+    card.setConfig(config);
+    refresh();
+    check(!get('[data-action="run_today"]').disabled, "Entity recovers after a temporary outage");
+    for (const button of card.querySelectorAll("button:not([hidden])")) {
+      check(button.offsetHeight >= 44, "Action has a touch target");
+    }
+    check(card.scrollWidth <= document.documentElement.clientWidth, "Card fits the viewport");
+    result.dataset.result = "pass";
+    result.textContent = "All card checks passed.";
+  } catch (err) {
+    result.dataset.result = "fail";
+    result.textContent = err.stack || String(err);
+    throw err;
+  }
+});
+</script>
+</body>
+</html>
