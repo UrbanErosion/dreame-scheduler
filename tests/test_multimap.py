@@ -12,6 +12,7 @@ import importlib
 import os
 import sys
 import types
+from unittest.mock import AsyncMock
 
 BASE = os.path.join(os.path.dirname(__file__), "..", "custom_components", "dreame_scheduler")
 
@@ -40,15 +41,19 @@ class _MockStore:
 
 
 _stub("homeassistant")
-_stub("homeassistant.core", HomeAssistant=object)
+_stub("homeassistant.core", HomeAssistant=object, Event=object, callback=lambda func: func)
+_stub("homeassistant.config_entries", ConfigEntry=object)
+_stub("homeassistant.util", dt=types.SimpleNamespace())
 _stub("homeassistant.helpers")
 _stub("homeassistant.helpers.storage", Store=_MockStore)
+_stub("homeassistant.helpers.event", async_track_state_change_event=None, async_track_time_interval=None)
 
 pkg = types.ModuleType("dreame_scheduler")
 pkg.__path__ = [os.path.abspath(BASE)]
 sys.modules["dreame_scheduler"] = pkg
 sc = importlib.import_module("dreame_scheduler.scheduler")
 wt = importlib.import_module("dreame_scheduler.week_tracker")
+engine = importlib.import_module("dreame_scheduler.engine")
 
 fails = []
 
@@ -87,13 +92,69 @@ async def main():
     await t.async_set_active_run({"kind": "daily", "segments": ["3"]})
     check("active_run tagged map=Upstairs", (t.active_run or {}).get("map") == "Upstairs")
 
-    # 4) Weekly reset clears every map's counters and aggregates the summary.
+    # 4) Weekly reset snapshots each floor before it clears the weekly counters.
+    await t.async_mark_unreachable(["5", "6"])
+    t.set_active_map("Ground")
+    await t.async_mark_unreachable(["6"])
+    await t.async_mark_unreachable(["6"])
+    t.state["week_start"] = "2025-12-29"
     summary = await t.async_reset_week("2026-01-05")
-    check("reset summary aggregates both maps", set(summary["cleaned"].keys()) == {"3", "5"})
+    ground = summary["maps"]["Ground"]
+    upstairs = summary["maps"]["Upstairs"]
+    check("reset retains separate timestamps for overlapping room IDs",
+          ground["cleaned"] == {"3": "2026-01-01T10:00", "5": "2026-01-01T10:00"}
+          and upstairs["cleaned"] == {"3": "2026-01-01T11:00"})
+    check("reset retains strikes on the correct floor",
+          ground["unreachable"] == {"6": 2} and upstairs["unreachable"] == {"5": 1, "6": 1})
     t.set_active_map("Ground")
     check("Ground cleared after reset", t.cleaned == {})
     t.set_active_map("Upstairs")
     check("Upstairs cleared after reset", t.cleaned == {})
+
+    # Exercise the real notification entry point. Room-name entities always
+    # describe the selected floor, even when the tracker still points elsewhere.
+    states = {
+        "select.test_selected_map": types.SimpleNamespace(state="Upstairs"),
+        "select.test_room_5_name": types.SimpleNamespace(state="Bedroom"),
+        "select.test_room_6_name": types.SimpleNamespace(state="Office"),
+    }
+    entry = types.SimpleNamespace(data={"prefix": "test"}, options={"rooms": {
+        "Ground": {"3": {}, "5": {}, "6": {"name": "Kitchen"}},
+        "Upstairs": {"3": {}, "5": {}, "6": {}, "7": {"enabled": False}},
+        "Loft": {"6": {}},
+    }})
+    eng = engine.SchedulerEngine(types.SimpleNamespace(states=states), entry, t)
+    eng._notify = AsyncMock()
+    t.set_active_map("Ground")
+    await eng._maybe_weekly_notice(summary)
+    message = eng._notify.await_args.args[1]
+    check("weekly notice counts identical segment IDs independently", message.splitlines() == [
+        "Ground — 2/3 rooms cleaned this week. Never finished: Kitchen (2× blocked).",
+        "Upstairs — 1/3 rooms cleaned this week. Never finished: Bedroom (1× blocked), Office (1× blocked).",
+        "Loft — 0/1 rooms cleaned this week. Never finished: Room 6.",
+    ])
+
+    entry.options["rooms"] = {"5": {"enabled": True}}
+    await eng._maybe_weekly_notice(summary)
+    message = eng._notify.await_args.args[1]
+    check("flat schedule never borrows another floor's room credit or assumes its targets",
+          message.splitlines() == [
+              "Upstairs — 0/1 rooms cleaned this week. Never finished: Bedroom (1× blocked).",
+              "Ground — Room records show 2 confirmed and 1 with blocked attempts. No room schedule available.",
+          ])
+    single = {"week_start": "2025-12-29", "maps": {"Upstairs": upstairs}}
+    await eng._maybe_weekly_notice(single)
+    check("single-floor missed-room wording survives unchanged",
+          eng._notify.await_args.args[1] == "0/1 rooms cleaned this week. Never finished: Bedroom (1× blocked).")
+    entry.options["rooms"] = {"3": {"enabled": True}}
+    await eng._maybe_weekly_notice(single)
+    check("single-floor complete wording survives unchanged",
+          eng._notify.await_args.args[1] == "✅ All 1 rooms were cleaned at least once this week.")
+    eng._notify.reset_mock()
+    await eng._maybe_weekly_notice({"week_start": None, "maps": {}})
+    entry.options["rooms"] = {}
+    await eng._maybe_weekly_notice(summary)
+    check("first week and an empty schedule stay silent", not eng._notify.await_count)
 
     # 5) Legacy flat state migrates into maps[default] on load (single-floor upgrade).
     _MockStore._data.clear()
