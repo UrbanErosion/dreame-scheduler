@@ -55,7 +55,6 @@ from .const import (
     DEFAULT_WINDOW_OVERRUN,
     DEFAULT_WINDOW_START,
     DOMAIN,
-    MAX_SEGMENTS,
     OPT_AWAY_GRACE_MIN,
     OPT_DOOR_RETRY_ENABLED,
     OPT_DOOR_RETRY_MIN,
@@ -108,8 +107,8 @@ from .const import (
     ROOM_TIMES,
     ROOM_WETNESS,
     WEEKDAYS,
-    room_entity,
 )
+from .room_roster import discover_rooms
 from .scheduler import (
     room_times as _norm_room_times,
     active_map_key,
@@ -204,12 +203,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
 
     def _discover_rooms(self) -> dict[str, str]:
         """Map of segment-id -> room name for segments that exist on the map."""
-        rooms: dict[str, str] = {}
-        for n in range(1, MAX_SEGMENTS + 1):
-            st = self.hass.states.get(room_entity("select", self._prefix, n, "name"))
-            if st and str(st.state).lower() not in ("unknown", "unavailable", "", "none"):
-                rooms[str(n)] = st.state
-        return rooms
+        return discover_rooms(self.hass, self._prefix, self.config_entry.data[CONF_VACUUM_ENTITY])
 
     def _map_key(self) -> str:
         """The robot's currently-selected map (multi-floor). The room entities and

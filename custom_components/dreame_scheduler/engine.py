@@ -174,6 +174,7 @@ from .mop_lost import is_mop_lost, plan_send as mop_lost_plan_send
 from .offline_hold import OFFLINE_REASON, hold_notice, robot_online
 from .run_resume import resume_with_start, stuck_flag_on_pause_change, task_words_stale
 from .parked_fault import fault_fix, parked_fault, plan as parked_fault_plan
+from .room_roster import mapped_rooms
 from .scheduler import (
     advance_mop_cadence,
     active_map_key,
@@ -2365,9 +2366,15 @@ class SchedulerEngine:
                 out[self._room_name(seg)] = box
         return out
 
-    def _room_name(self, seg) -> str:
-        nm = self._sval(room_entity("select", self._prefix, seg, "name"))
-        return nm or f"Room {seg}"
+    def _room_name(self, seg, *, floor=None) -> str:
+        selected = self.hass.states.get(entity_of("select", self._prefix, "selected_map"))
+        if active_map_key(selected.state if selected else None) != (floor or self.tracker.active_map):
+            return (self._rooms().get(str(seg)) or {}).get("name") or f"Room {seg}"
+        name = self._sval(room_entity("select", self._prefix, seg, "name"))
+        if name:
+            return name
+        vacuum = self.hass.states.get(self._vacuum_entity)
+        return mapped_rooms(vacuum, selected).get(str(seg), f"Room {seg}")
 
     def _cleaning_count(self) -> int | None:
         """Monotonic 'number of cleans' counter — increments once per completed
@@ -3610,7 +3617,7 @@ class SchedulerEngine:
                 if seg in cleaned:
                     continue
                 # Dreame's live room-name entities follow the selected map.
-                name = (self._room_name(seg) if floor == selected
+                name = (self._room_name(seg, floor=selected) if floor == selected
                         else rooms[seg].get("name") or f"Room {seg}")
                 count = int(blocked.get(seg, 0))
                 missed.append(f"{name} ({count}× blocked)" if count else name)
