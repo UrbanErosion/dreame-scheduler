@@ -200,6 +200,7 @@ from .scheduler import (
     SWEEP_ONLY_MODE,
 )
 from .week_tracker import WeekTracker
+from .floor_history import floor_scope
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -2353,8 +2354,18 @@ class SchedulerEngine:
     async def _log_stuck(self, payload: dict) -> None:
         """Log a stuck event, tagging whether it happened at a shut room's doorway
         so the trap-learner can keep transient door-catches out of no-go suggestions."""
-        payload["door_closed"] = self._stuck_at_shut_door(payload.get("x"), payload.get("y"))
+        if self._floor_scope().live:
+            payload["door_closed"] = self._stuck_at_shut_door(payload.get("x"), payload.get("y"))
+        else:
+            # A pinned run can outlive its selected map. Retain the event but
+            # do not teach either floor this position.
+            payload["map"] = None
         await self.tracker.async_log_stuck(payload)
+
+    def _floor_scope(self):
+        vacuum = self.hass.states.get(self._vacuum_entity)
+        selected = self.hass.states.get(entity_of("select", self._prefix, "selected_map"))
+        return floor_scope(self.tracker, self._opt(OPT_ROOMS, {}) or {}, vacuum, selected)
 
     def _room_boxes_by_name(self) -> dict:
         """Each room's NAME -> its map bounding box, for clamping a learned no-go to
@@ -3653,7 +3664,10 @@ class SchedulerEngine:
         confirmed) a permanent no-go for any spot that has trapped the robot on
         enough separate runs. One-off / mobile hazards (a pet toy) instead raise
         a 'tidy the floor' reminder, since a no-go can't fix a thing that moves."""
-        events = list(self.tracker.stuck_events or [])
+        scope = self._floor_scope()
+        if not scope.live:
+            return
+        events = [ev for ev in self.tracker.stuck_events if scope.contains(ev)]
         if not events:
             return
         try:
@@ -3664,9 +3678,10 @@ class SchedulerEngine:
         suggested = self.tracker.learned_suggested
         promoted = self.tracker.learned_promoted
         for s in report["nogo_suggestions"]:
-            if s["key"] in suggested or s["key"] in promoted:
+            key = scope.suggestion_key(s["key"])
+            if key in suggested or key in promoted:
                 continue
-            await self.tracker.async_mark_suggested(s["key"], now.isoformat())
+            await self.tracker.async_mark_suggested(key, now.isoformat())
             if bool(self._opt(OPT_NOTIFY_STUCK, DEFAULT_NOTIFY_STUCK)):
                 await self._notify(
                     "🧠 Recurring trap learned",
@@ -3732,7 +3747,8 @@ class SchedulerEngine:
             return
         stale_days = self._opt_int(OPT_MANUAL_CLEAN_STALE_DAYS, DEFAULT_MANUAL_CLEAN_STALE_DAYS)
         min_misses = self._opt_int(OPT_MANUAL_CLEAN_MIN_MISSES, DEFAULT_MANUAL_CLEAN_MIN_MISSES)
-        history = list(self.tracker.history or [])
+        scope = self._floor_scope()
+        history = [row for row in self.tracker.history if scope.contains(row)]
         unreachable = self.tracker.unreachable
         cleaned = self.tracker.cleaned
         prev = self.tracker.manual_clean
@@ -3833,10 +3849,13 @@ class SchedulerEngine:
         robot barely moves; the last stuck coordinate for this room is somewhere
         it actually reached, so a goto there succeeds and parks it right at the
         edge of the trouble spot — exactly what 'show me' wants to point at."""
+        scope = self._floor_scope()
+        if not scope.live:
+            return None
         name = self._room_name(seg)
         best = None
         for ev in (self.tracker.stuck_events or []):
-            if str(ev.get("room")) != str(name):
+            if not scope.contains(ev) or str(ev.get("room")) != str(name):
                 continue
             x, y = ev.get("x"), ev.get("y")
             if x is None or y is None:
@@ -3863,6 +3882,9 @@ class SchedulerEngine:
             seg = str(seg) if seg else next(iter(targets), None)
             if not seg or seg not in targets:
                 return
+            scope = self._floor_scope()
+            if not scope.live:
+                return
             name = (targets[seg] or {}).get("name") or self._room_name(seg)
             # Aim at a point the robot can actually REACH (where it last got stuck
             # trying for this room), not the room's centroid — a goto to the
@@ -3888,6 +3910,10 @@ class SchedulerEngine:
                 saved_vol = None
             if saved_vol:
                 await self._svc("number", "set_value", {"entity_id": vol_ent, "value": 0})
+            if self._floor_scope() != scope:
+                if saved_vol:
+                    await self._svc("number", "set_value", {"entity_id": vol_ent, "value": saved_vol})
+                return
             try:
                 await self._svc(DREAME_DOMAIN, "vacuum_goto",
                                 {"entity_id": self._vacuum_entity, "x": target[0], "y": target[1]})
@@ -4104,7 +4130,10 @@ class SchedulerEngine:
         learner never applies one on its own. With no key, applies every pending
         suggestion. Returns a small summary for the GUI."""
         async with self._eval_lock:
-            events = list(self.tracker.stuck_events or [])
+            scope = self._floor_scope()
+            if not scope.live:
+                return {"applied": 0, "rooms": [], "error": "selected map unavailable or changed"}
+            events = [ev for ev in self.tracker.stuck_events if scope.contains(ev)]
             try:
                 walls, zones, no_mops = self._current_zones()
             except ZoneReadError as exc:
@@ -4113,6 +4142,8 @@ class SchedulerEngine:
                 return {"applied": 0, "rooms": [], "error": "could not read existing zones"}
             report = trap_learner.analyze(events, zones, room_boxes=self._room_boxes_by_name())
             promoted = self.tracker.learned_promoted
+            for s in report["nogo_suggestions"]:
+                s["key"] = scope.suggestion_key(s["key"])
             todo = [s for s in report["nogo_suggestions"]
                     if s["key"] not in promoted and (key is None or s["key"] == key)]
             if not todo:
@@ -4122,6 +4153,8 @@ class SchedulerEngine:
                                 {"entity_id": self._vacuum_entity})
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("apply_learned_nogo: map backup failed: %s", exc)
+            if self._floor_scope() != scope:
+                return {"applied": 0, "rooms": [], "error": "selected map changed during backup"}
             boxes = [s["box"] for s in todo]
             await self._write_zones(walls, zones + boxes, no_mops)
             now_iso = dt_util.now().isoformat()

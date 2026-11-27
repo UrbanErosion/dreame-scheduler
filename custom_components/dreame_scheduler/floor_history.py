@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import json
 
 from .scheduler import DEFAULT_MAP_KEY, migrate_rooms_to_maps
 
@@ -16,7 +17,11 @@ class FloorScope:
     def contains(self, row) -> bool:
         if not isinstance(row, Mapping):
             return False
-        return row.get("map") == self.key or (row.get("map") is None and self.include_untagged)
+        return row.get("map") == self.key or ("map" not in row and self.include_untagged)
+
+    def suggestion_key(self, key: str) -> str:
+        """Scope a map action token. Keep the original key on default-only setups."""
+        return key if self.include_untagged else json.dumps([self.key, key], separators=(",", ":"))
 
 
 def floor_scope(tracker, schedules, vacuum, selected) -> FloorScope:

@@ -388,6 +388,7 @@ def build_report(hass: HomeAssistant, entry: ConfigEntry, engine) -> dict:
     learn = trap_learner.analyze(stuck_events if scope.live else [], existing_zones, room_boxes=room_boxes)
     promoted = dict(getattr(tracker, "learned_promoted", {}) or {})
     for s in learn["nogo_suggestions"]:
+        s["key"] = scope.suggestion_key(s["key"])
         if s["key"] in promoted:
             continue
         suggestions.append({
