@@ -130,6 +130,23 @@ Python but **does not copy `www/`** — copy that file to `/config/www/` yoursel
 and add it as a dashboard resource (`/local/dreame-scheduler-card.js`), or use
 the add-on's **Add to HA** tab which generates the cards with your entity ids.
 
+Open **Weekly room coverage** to see which rooms have received credit and which
+are pending. Blocked rooms show their recorded attempt counts. The last-run
+line summarizes the most recent job separately from weekly progress.
+
+```yaml
+type: custom:dreame-scheduler-card
+entity: sensor.vacuum_scheduler_status
+vacuum_entity: vacuum.robot
+```
+
+Replace both IDs with your own entities. The optional `vacuum_entity` enables
+**Return to base** for that robot during a clean. The companion add-on's
+**Cleaning report** lets you switch between the current day and week, then
+filter rooms by outcome.
+
+<p><img src="images/room-coverage-card.png" width="290" alt="Scheduler card showing two credited rooms and two pending rooms"> <img src="images/room-outcomes.png" width="215" alt="Room report with weekly outcomes and a reason for a missed room"></p>
+
 ## Install (HACS)
 
 1. In **HACS**, search for **Dreame Scheduler** and install it (it's in the
@@ -159,6 +176,13 @@ trialled on real two-map setups, so feedback is welcome. See the
 
 ## Troubleshooting
 
+For a compatibility or room-credit report, open **Settings → Devices & services
+→ Dreame Scheduler**, open the menu for the affected entry, and choose
+**Download diagnostics**. The scheduler section includes sensor availability,
+robot fault information, credit counts and which room-evidence fields the robot
+reports. Room names, map paths and raw cleaning-history records are excluded
+from that section. Review the full Home Assistant download before sharing it.
+
 ### A room is skipped every run as "Blocked by door" — but there is no door
 
 If one room chronically fails with rotating excuses in the Dreame app / cleaning
@@ -187,11 +211,11 @@ Dreame robots dock **mid-task** to wash the mop or recharge, log a *partial*
 history record (`completed: false`), and then head back out. The scheduler
 holds the run open through these dock visits: it never finalises while the
 robot reports an active task, treats a `completed: false` record as "will
-resume" (waiting up to 30 min parked before giving up), and only banks a
-room as cleaned from a `completed: true` record or from actually seeing the
-robot enter it. If you're on a version before this logic (< 2026-07), a
-mid-run dock visit could mis-mark the not-yet-cleaned rooms as skipped — or
-credit rooms the robot never reached.
+resume" (waiting up to 30 min parked before giving up). For scheduled
+multi-room cleans, the scheduler checks evidence of individual room completion.
+A matched, successfully completed single-room job can credit its one room.
+Blocked rooms stay pending. When the robot supplies too little evidence to
+decide, the room stays pending without gaining a blocked attempt.
 
 ## Status
 

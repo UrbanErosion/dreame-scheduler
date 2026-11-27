@@ -19,6 +19,7 @@ from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 
+from .room_roster import discover_rooms
 from .scheduler import (
     active_map_key,
     is_flat_rooms,
@@ -77,7 +78,6 @@ from .const import (
     DEFAULT_WINDOW_OVERRUN,
     DEFAULT_WINDOW_START,
     DOMAIN,
-    MAX_SEGMENTS,
     OPT_AWAY_GRACE_MIN,
     OPT_CATCHUP_DAY,
     OPT_CATCHUP_ENABLED,
@@ -140,7 +140,6 @@ from .const import (
     OPT_WINDOW_OVERRUN,
     OPT_WINDOW_START,
     WEEKDAYS,
-    room_entity,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -316,14 +315,6 @@ def async_register_config_services(hass: HomeAssistant) -> None:
         return [str(o).strip().lower().replace(" ", "_") for o in lst
                 if str(o).strip().lower() not in _BAD_OPTS]
 
-    def _discover_rooms(prefix: str) -> dict[str, str]:
-        rooms: dict[str, str] = {}
-        for n in range(1, MAX_SEGMENTS + 1):
-            name = _sval(room_entity("select", prefix, n, "name"))
-            if name:
-                rooms[str(n)] = name
-        return rooms
-
     def _scheduler_entities(entry: ConfigEntry) -> dict[str, str]:
         """This scheduler's OWN entities, keyed by their stable unique-id suffix
         (status/rooms_cleaned/enabled/clean_now/... ), read from the registry so
@@ -359,7 +350,7 @@ def async_register_config_services(hass: HomeAssistant) -> None:
             "prefix": prefix,
             "options": opts,
             "defaults": _DEFAULTS,
-            "rooms": _discover_rooms(prefix),
+            "rooms": discover_rooms(hass, prefix, entry.data.get(CONF_VACUUM_ENTITY)),
             "modes": _opt_options(prefix, "cleaning_mode", entry.data.get(CONF_VACUUM_ENTITY), "cleaning_mode_list"),
             "suctions": _opt_options(prefix, "suction_level", entry.data.get(CONF_VACUUM_ENTITY), "suction_level_list"),
             "weekdays": WEEKDAYS,

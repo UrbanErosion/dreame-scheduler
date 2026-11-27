@@ -481,12 +481,52 @@ footer {
 .seg-toggle { display: inline-flex; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 3px; flex: 0 0 auto; }
 .seg-btn { border: none; background: transparent; color: var(--muted); padding: 5px 13px; border-radius: 6px; cursor: pointer; font-size: 12.5px; font-family: var(--font-d); font-weight: 600; letter-spacing: .02em; }
 .seg-btn.active { background: var(--accent); color: var(--accent-fg); }
-.report-summary { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 14px; }
 .rsum { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 8px; background: var(--elevated); border: 1px solid var(--border); font-size: 13px; }
 .rsum b { font-weight: 700; font-family: var(--font-m); }
 .report-rooms { display: flex; flex-direction: column; }
-.rrow { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 10px; padding: 9px 2px; border-bottom: 1px solid var(--border); }
-.rrow:last-child { border-bottom: 0; }
+
+/* The report keeps its controls mounted while the room list changes. */
+#report.report-unavailable > .card:not(.report-outcomes) { display: none; }
+#report .report-outcomes { padding: clamp(16px, 3vw, 26px); }
+#report .report-outcomes .report-head { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; }
+@media (max-width: 390px) {
+  #report .report-outcomes .report-head { grid-template-columns: 1fr; gap: 2px; }
+  #report-scope { justify-self: start; }
+}
+#report .report-outcomes h2 { font-size: 1.2rem; }
+#report .report-outcomes .seg-btn { min-height: 44px; }
+#report .report-total { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 14px; margin-top: 12px; }
+#report-clean-count { font-size: clamp(1.2rem, 3vw, 1.65rem); font-weight: 620; letter-spacing: -.035em; }
+#report-area, #report .report-room-meta { color: var(--muted); font-size: .82rem; }
+#report-bars { display: flex; gap: 3px; height: 7px; border-radius: 4px; overflow: hidden; background: var(--elevated); margin: 6px 0 14px; }
+#report .report-bar-cleaned { background: var(--ok); }
+#report .report-bar-pending { background: var(--accent); }
+#report .report-bar-skipped { background: var(--danger); }
+#report-summary { display: flex; flex-wrap: wrap; gap: 6px; padding-bottom: 14px; }
+#report-summary button {
+  display: inline-flex; align-items: center; gap: 6px; min-height: 44px; padding: 4px 10px;
+  border: 1px solid var(--border); border-radius: 7px; cursor: pointer;
+  background: var(--card); color: var(--text); font: 500 .8rem var(--font-b);
+}
+#report-summary button[hidden] { display: none; }
+#report-summary button[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); }
+#report-summary button b { font: 600 .76rem var(--font-m); }
+#report .report-outcomes button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#report .report-room {
+  display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 1px 10px;
+  align-items: center; padding: 10px 0; border-top: 1px solid var(--border);
+}
+#report .report-room-name, #report .report-room-meta { overflow-wrap: anywhere; }
+#report .report-room-meta { grid-column: 1 / -1; }
+#report .report-outcome {
+  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+  font-size: .78rem; font-weight: 550; color: var(--text);
+}
+#report .report-outcome::before { content: ""; width: .52rem; height: .52rem; border-radius: 50%; background: var(--muted); }
+#report [data-outcome="cleaned"]::before { background: var(--ok); }
+#report [data-outcome="pending"]::before { background: var(--accent); }
+#report [data-outcome="skipped"]::before { background: var(--danger); }
+#report .report-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
 
 /* Maintenance / wear-part panel */
 .report-consumables { display: flex; flex-direction: column; }
@@ -502,18 +542,10 @@ footer {
 .cpill-low { background: #e0655b; border-color: #e0655b; color: #fff; }
 .creset { padding: 6px 12px; font-size: 12.5px; }
 .rbadge { font-size: 10.5px; font-weight: 600; padding: 3px 8px; border-radius: 6px; white-space: nowrap; font-family: var(--font-m); }
-.rname { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.rmeta { color: var(--muted); font-size: 12px; text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.rreason { color: var(--danger); }
-.rok { color: var(--ok); }
 .st-ok { background: rgba(61,220,151,.13); color: var(--ok); }
 .st-bad { background: rgba(244,98,110,.13); color: var(--danger); }
 .st-pend { background: var(--accent-soft); color: var(--accent-cyan); }
 .st-off { background: var(--elevated); color: var(--muted); }
-@media (max-width: 560px) {
-  .rrow { grid-template-columns: auto 1fr; }
-  .rmeta { grid-column: 2; text-align: left; white-space: normal; }
-}
 /* coverage thumbnails */
 .report-coverage { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 6px; }
 .cov-card { margin: 0; flex: 0 0 auto; width: 220px; background: var(--bg); border: 1px solid var(--border); border-radius: 9px; overflow: hidden; cursor: pointer; transition: border-color .12s, transform .12s; }

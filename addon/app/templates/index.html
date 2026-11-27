@@ -160,18 +160,29 @@
 
     <!-- REPORT -->
     <section id="report" class="section">
-      <div class="card">
+      <div class="card report-outcomes">
         <div class="report-head">
           <div>
             <h2>Cleaning report</h2>
-            <p class="hint" id="report-sub">What got cleaned this week, what was missed and why.</p>
+            <p class="hint" id="report-sub"></p>
           </div>
-          <div class="seg-toggle" id="report-scope">
-            <button class="seg-btn active" data-scope="week" type="button">This week</button>
-            <button class="seg-btn" data-scope="today" type="button">Today</button>
+          <div class="seg-toggle" id="report-scope" role="group" aria-label="Report period">
+            <button class="seg-btn active" data-scope="week" aria-pressed="true" type="button">This week</button>
+            <button class="seg-btn" data-scope="today" aria-pressed="false" type="button">Today</button>
           </div>
         </div>
-        <div id="report-summary" class="report-summary"></div>
+        <div id="report-results" hidden>
+          <div class="report-total"><strong id="report-clean-count"></strong><span id="report-area"></span></div>
+          <div id="report-bars" aria-hidden="true"></div>
+          <div id="report-summary" role="group" aria-label="Filter rooms by outcome">
+            <button type="button" data-filter="all" aria-pressed="true">All rooms <b></b></button>
+            <button type="button" data-filter="cleaned" aria-pressed="false">Cleaned <b></b></button>
+            <button type="button" data-filter="pending" aria-pressed="false">Pending <b></b></button>
+            <button type="button" data-filter="skipped" aria-pressed="false">Missed <b></b></button>
+            <button type="button" data-filter="not_scheduled" aria-pressed="false">Off schedule <b></b></button>
+          </div>
+        </div>
+        <p id="report-list-status" class="report-sr" role="status"></p>
         <div id="report-rooms" class="report-rooms"><div class="hint">Loading…</div></div>
       </div>
 
