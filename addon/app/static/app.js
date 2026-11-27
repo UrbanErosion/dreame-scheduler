@@ -53,12 +53,14 @@ async function api(path, opts) {
 }
 
 async function boot() {
+  const requested = SELECTED_VAC;
   try {
     const [cfg, states, notify] = await Promise.all([
       api("api/ha/config" + vacQ()),
       api("api/ha/states").catch(() => ({ entities: [] })),
       api("api/ha/notify_services").catch(() => ({ services: [] })),
     ]);
+    if (requested !== SELECTED_VAC) return;
     CFG = cfg; ENTITIES = states.entities || []; NOTIFY = notify.services || [];
     if (!cfg.found) {
       $("#load-banner").style.display = "block";
@@ -72,7 +74,13 @@ async function boot() {
     renderVacPicker();
     render();
     _homeLoaded = true; renderHome();   // Home is the default tab
+    if ($("#report").classList.contains("active")) loadReport();
+    if ($("#dashboard").classList.contains("active")) {
+      renderDashboard();
+      _dashboardLoaded = true;
+    }
   } catch (e) {
+    if (requested !== SELECTED_VAC) return;
     $("#load-banner").style.display = "block";
     $("#load-banner").textContent = "Couldn't reach Home Assistant: " + e.message;
   }
@@ -108,7 +116,13 @@ function renderVacPicker() {
       renderVacPicker(); return;
     }
     SELECTED_VAC = sel.value;
-    REPORT = null; MAP = null; _reportLoaded = false; MAP_DIRTY = false;
+    REPORT = null; MAP = null; MAP_DIRTY = false;
+    _dashboardLoaded = false;
+    $("#dash-cards").replaceChildren();
+    _reportRequest = null;
+    _reportFilter = "all";
+    $("#hdr-robot").style.display = "none";
+    reportMessage("Loading…");
     boot();   // reload config / rooms / report for the chosen robot
   });
   wrap.appendChild(label); wrap.appendChild(sel);
@@ -1192,7 +1206,7 @@ async function renderMap() {
     no_mops: (m.no_mopping_areas || []).map(_coerceBox).filter(Boolean),
   };
   // obstacles to plot (from the report; fetch it if the Report tab wasn't opened)
-  if (!REPORT) { try { REPORT = await api("api/ha/report" + vacQ()); } catch (e) {} }
+  if (!REPORT) { try { await fetchSelectedReport(); } catch (e) {} }
   MAP_OBSTACLES = (REPORT && REPORT.obstacles) || [];
   document.getElementById("map-toolbar").style.display = "flex";
   document.getElementById("map-side").style.display = "block";
@@ -2570,8 +2584,10 @@ const DECK_META = {}; DECK_REGISTRY.forEach(c => DECK_META[c.id] = c);
 
 async function renderHome() {
   const deck = $("#card-deck");
-  try { if (!REPORT) REPORT = await api("api/ha/report" + vacQ()); }
+  const requested = SELECTED_VAC;
+  try { if (!REPORT) await fetchSelectedReport(); }
   catch (e) { deck.innerHTML = '<div class="hint err">Could not load: ' + esc(e.message) + "</div>"; return; }
+  if (requested !== SELECTED_VAC) return;
   _syncHeaderRobot();
   $("#home-title").textContent = CFG && CFG.title ? CFG.title.trim() : "Overview";
   deck.innerHTML = "";
@@ -3131,6 +3147,10 @@ function _deckPersist() {
 let _dashboardLoaded = false;
 function renderDashboard() {
   const box = $("#dash-cards");
+  if (!CFG || (CFG.vacuum && CFG.vacuum !== SELECTED_VAC)) {
+    box.textContent = "Loading…";
+    return;
+  }
   // Prefer the integration's reported ids; else derive them from the title the
   // way HA slugifies has_entity_name entities. Works for ANY user's vacuum.
   const ents = (CFG && CFG.scheduler_entities) || {};
@@ -3149,7 +3169,7 @@ function renderDashboard() {
   cards.push({ id: "custom", title: "⭐ Dreame Scheduler card (GUI picker)", excludeFromView: true,
     desc: "A richer all-in-one card that shows in HA's “Add card” picker. Install once: copy dreame-scheduler-card.js into /config/www/, add /local/dreame-scheduler-card.js as a resource (Settings → Dashboards → ⋮ → Resources → type: JavaScript Module), then Add card → “Dreame Scheduler”. Or paste this into a Manual card:", yaml:
 `type: custom:dreame-scheduler-card
-entity: ${S}` });
+entity: ${S}${VAC ? "\nvacuum_entity: " + VAC : ""}` });
   cards.push({ id: "robot-card", title: "🤖 Robot status card (GUI picker)", excludeFromView: true,
     desc: "Live robot state (battery / what it's doing / error / tanks). Same install as above; then Add card → “Dreame Robot Status”. Or paste into a Manual card:", yaml:
 `type: custom:dreame-robot-card
@@ -3247,7 +3267,8 @@ function _dashCardEl(title, desc, yaml) {
 }
 
 // ---- Report tab ----
-let _reportLoaded = false, REPORT = null, _reportScope = "week";
+let REPORT = null, _reportScope = "week", _reportFilter = "all";
+let _reportRequest = null;
 const STATUS_META = {
   cleaned:       { dot: "🟢", label: "Cleaned",  cls: "st-ok" },
   skipped:       { dot: "🔴", label: "Missed",   cls: "st-bad" },
@@ -3255,87 +3276,143 @@ const STATUS_META = {
   not_scheduled: { dot: "⚪", label: "Off",      cls: "st-off" },
 };
 
-async function loadReport() {
+// Home, the map and the report share one in-flight read for the selected robot.
+// A previous robot's response must never replace the current room list.
+function fetchSelectedReport() {
+  if (_reportRequest) return _reportRequest;
+  const request = api("api/ha/report" + vacQ()).then(data => {
+    if (request === _reportRequest) REPORT = data;
+    return data;
+  }).finally(() => {
+    if (request === _reportRequest) _reportRequest = null;
+  });
+  _reportRequest = request;
+  return request;
+}
+
+function reportMessage(message, retry = false) {
+  $("#report").classList.add("report-unavailable");
+  $("#report-results").hidden = true;
+  $("#report-sub").textContent = "";
+  $("#report-list-status").textContent = "";
   const box = $("#report-rooms");
+  box.textContent = message;
+  if (retry) {
+    const button = el("button", "btn ghost");
+    button.type = "button"; button.textContent = "Retry";
+    button.onclick = loadReport;
+    box.appendChild(button);
+  }
+}
+
+async function loadReport() {
+  if (!CFG || (CFG.vacuum && CFG.vacuum !== SELECTED_VAC)) return;
+  const requested = SELECTED_VAC;
   try {
-    REPORT = await api("api/ha/report" + vacQ());
+    const data = await fetchSelectedReport();
+    if (requested !== SELECTED_VAC || REPORT !== data) return;
     _syncHeaderRobot();
-    if (!REPORT || REPORT.found === false) {
-      box.innerHTML = '<div class="hint">No report available yet.</div>';
+    if (!data || data.found === false || !Array.isArray(data.rooms)) {
+      reportMessage("No room report available yet.", true);
       return;
     }
     renderReport();
+    document.dispatchEvent(new CustomEvent("dreame-room-report", { detail: data }));
   } catch (e) {
-    _reportLoaded = false;                            // let re-opening the tab retry
-    box.innerHTML = '<div class="hint err">Could not load report: ' + esc(e.message) +
-      ' <a href="#" id="rep-retry">Retry</a></div>';
-    const rl = document.getElementById("rep-retry");
-    if (rl) rl.onclick = ev => { ev.preventDefault(); _reportLoaded = true; loadReport(); };
+    if (requested !== SELECTED_VAC) return;
+    reportMessage("Could not load report: " + e.message, true);
   }
 }
 
-function _isToday(iso) {
-  if (!iso) return false;
-  const d = new Date(iso), n = new Date();
-  return d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate();
+function reportRoomStatus(room, scope, generated) {
+  if (scope === "week") return room.status;
+  if (room.status_today != null) return room.status_today;
+  // Older integrations have no daily failure evidence. A weekly miss cannot
+  // establish today's result. Compare ISO dates only with a shared offset.
+  const zone = value => typeof value === "string" && value.match(/(Z|[+-]\d{2}:\d{2})$/)?.[0];
+  if (room.cleaned_at && generated && zone(generated) && zone(generated) === zone(room.cleaned_at)
+      && generated.slice(0, 10) === room.cleaned_at.slice(0, 10)) return "cleaned";
+  return room.scheduled_today ? "pending" : "not_scheduled";
 }
 
-// Effective status for the chosen scope (today narrows "cleaned" to today's date).
-function _statusForScope(r) {
-  if (_reportScope === "today") {
-    if (r.status === "cleaned") return _isToday(r.cleaned_at) ? "cleaned" : "pending";
-    if (!r.scheduled_today && r.status !== "skipped") return "not_scheduled";
+function renderReportRooms() {
+  if (!REPORT || !Array.isArray(REPORT.rooms) || $("#report").classList.contains("report-unavailable")) return;
+  const today = _reportScope === "today";
+  const rooms = REPORT.rooms.map(r => ({ r, s: reportRoomStatus(r, _reportScope, REPORT.generated) }))
+    .filter(({ s }) => !today || s !== "not_scheduled");
+  const counts = { cleaned: 0, pending: 0, skipped: 0, not_scheduled: 0 };
+  rooms.forEach(({ s }) => { if (Object.prototype.hasOwnProperty.call(counts, s)) counts[s]++; });
+  const date = String(today ? REPORT.generated || "" : REPORT.week_start || "").slice(0, 10);
+  const dateAtNoon = new Date(date + "T12:00:00");
+  const dateLabel = /^\d{4}-\d{2}-\d{2}$/.test(date) && !isNaN(dateAtNoon)
+    ? (today ? "" : "Week of ") + dateAtNoon.toLocaleDateString([], { month: "short", day: "numeric" })
+    : "";
+  $("#report-sub").textContent = [dateLabel, REPORT.map !== "default" && REPORT.map].filter(Boolean).join(" · ");
+  $("#report-results").hidden = !rooms.length;
+  const active = rooms.length - counts.not_scheduled;
+  $("#report-clean-count").textContent = active ? counts.cleaned + " of " + active + " rooms cleaned"
+    : "No rooms scheduled";
+  // The Dreame cleaned-area sensor is a job reading, not today's sum.
+  const area = REPORT.cleaned_area_today;
+  $("#report-area").textContent = today && area != null && area !== "" ?
+    "Robot-reported area " + area + (/m²/i.test(area) ? "" : " m²") : "";
+
+  const bars = $("#report-bars");
+  bars.replaceChildren();
+  for (const kind of ["cleaned", "pending", "skipped"]) {
+    if (!counts[kind]) continue;
+    const part = el("span", "report-bar-" + kind);
+    part.style.flex = counts[kind]; bars.appendChild(part);
   }
-  return r.status;
+  // Off-schedule rooms are available only in the weekly view. Keep all other
+  // controls mounted so refreshes preserve the user's keyboard focus.
+  if (today && _reportFilter === "not_scheduled") _reportFilter = "all";
+  $$("#report-summary button").forEach(button => {
+    const kind = button.dataset.filter;
+    button.hidden = kind === "not_scheduled" && (today || (!counts.not_scheduled && _reportFilter !== kind));
+    button.setAttribute("aria-pressed", String(kind === _reportFilter));
+    button.querySelector("b").textContent = kind === "all" ? rooms.length : counts[kind];
+  });
+
+  const shown = rooms.filter(({ s }) => _reportFilter === "all" || s === _reportFilter);
+  $("#report-list-status").textContent = shown.length + (shown.length === 1 ? " room shown" : " rooms shown");
+  const box = $("#report-rooms");
+  box.replaceChildren();
+  if (!shown.length) {
+    const empty = el("p", "hint");
+    empty.textContent = rooms.length ? "No rooms match this filter." :
+      (today ? "No rooms scheduled or recorded today." : "No rooms reported this week.");
+    box.appendChild(empty);
+  }
+  shown.forEach(({ r, s }) => {
+    const label = { cleaned: "Cleaned", skipped: "Missed", pending: "Pending", not_scheduled: "Off schedule" }[s];
+    const row = el("div", "report-room");
+    const title = el("strong", "report-room-name");
+    title.textContent = r.name || "Room " + r.seg;
+    const outcome = el("span", "report-outcome");
+    outcome.dataset.outcome = label ? s : "unknown";
+    outcome.textContent = label || "Unknown";
+    const meta = el("span", "report-room-meta");
+    const settings = [r.mode, r.suction].filter(v => v && v !== "(default)").map(capWords);
+    const schedule = s === "pending" && Array.isArray(r.day_names) ? r.day_names.join(" ") : "";
+    if (s === "skipped") {
+      const reason = today ? r.blocked_reason_today : r.blocked_reason;
+      if (!today && Number(r.fail_count) > 1) settings.unshift(Number(r.fail_count) + " misses this week");
+      if (reason) settings.unshift(String(reason).replace(/_/g, " "));
+    } else if (s === "cleaned" && r.cleaned_at) {
+      const time = fmtWhen(r.cleaned_at);
+      if (time) settings.unshift(time);
+    }
+    meta.textContent = [schedule, ...settings].filter(Boolean).join(" · ");
+    row.append(title, outcome);
+    if (meta.textContent) row.appendChild(meta);
+    box.appendChild(row);
+  });
 }
 
 function renderReport() {
-  if (!REPORT) return;
-  const rooms = (REPORT.rooms || []);
-  const scoped = rooms
-    .map(r => ({ r, s: _statusForScope(r) }))
-    .filter(x => _reportScope === "week" ? true : (x.s !== "not_scheduled"));
-
-  // summary chips
-  const counts = { cleaned: 0, skipped: 0, pending: 0, not_scheduled: 0 };
-  scoped.forEach(x => { counts[x.s] = (counts[x.s] || 0) + 1; });
-  const sum = $("#report-summary");
-  sum.innerHTML = "";
-  [["cleaned", "cleaned"], ["skipped", "missed"], ["pending", "pending"]].forEach(([k, lbl]) => {
-    const chip = el("span", "rsum " + STATUS_META[k].cls);
-    chip.innerHTML = STATUS_META[k].dot + " <b>" + (counts[k] || 0) + "</b> " + lbl;
-    sum.appendChild(chip);
-  });
-  if (REPORT.cleaned_area_today && _reportScope === "today") {
-    const a = el("span", "rsum"); a.innerHTML = "📐 <b>" + esc(REPORT.cleaned_area_today) + "</b> m² today";
-    sum.appendChild(a);
-  }
-
-  // room rows
-  const box = $("#report-rooms");
-  box.innerHTML = "";
-  if (!scoped.length) { box.innerHTML = '<div class="hint">Nothing scheduled for this view.</div>'; return; }
-  scoped.forEach(({ r, s }) => {
-    const m = STATUS_META[s] || STATUS_META.not_scheduled;
-    const row = el("div", "rrow");
-    const meta = [];
-    if (r.mode) meta.push(esc(r.mode));
-    if (r.suction) meta.push(esc(r.suction));
-    if (r.day_names && r.day_names.length) meta.push(r.day_names.join(" "));
-    let sub = meta.join(" · ");
-    if (s === "skipped") {
-      sub = '<span class="rreason">✗ ' + esc(r.blocked_reason || "couldn’t reach") +
-            (r.fail_count > 1 ? " · " + (Number(r.fail_count) || 0) + "× in a row" : "") + "</span>" + (sub ? " · " + sub : "");
-    } else if (s === "cleaned" && r.cleaned_at) {
-      sub = '<span class="rok">✓ ' + esc(new Date(r.cleaned_at).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })) + "</span>" + (sub ? " · " + sub : "");
-    }
-    row.innerHTML =
-      '<span class="rbadge ' + m.cls + '">' + m.dot + " " + m.label + "</span>" +
-      '<span class="rname">' + esc(r.name) + "</span>" +
-      '<span class="rmeta">' + sub + "</span>";
-    box.appendChild(row);
-  });
-
+  $("#report").classList.remove("report-unavailable");
+  renderReportRooms();
   renderManualClean();
   renderSuggestions();
   renderConsumables();
@@ -3914,8 +3991,18 @@ async function addObstacleNoGo(x, y, label, btn) {
 $("#report-scope").addEventListener("click", (e) => {
   const b = e.target.closest(".seg-btn"); if (!b) return;
   _reportScope = b.dataset.scope;
-  $$("#report-scope .seg-btn").forEach(x => x.classList.toggle("active", x === b));
-  renderReport();
+  $$("#report-scope .seg-btn").forEach(x => {
+    x.classList.toggle("active", x === b);
+    x.setAttribute("aria-pressed", String(x === b));
+  });
+  renderReportRooms();
+});
+
+$("#report-summary").addEventListener("click", e => {
+  const button = e.target.closest("button[data-filter]");
+  if (!button) return;
+  _reportFilter = button.dataset.filter;
+  renderReportRooms();
 });
 
 $("#report-obstacles").addEventListener("click", (e) => {
@@ -3947,7 +4034,7 @@ document.addEventListener("click", (e) => {
     if (nav) nav.classList.remove("open");           // picking a tab closes the ☰ menu
     if (tabBtn.dataset.tab === "map" && !_mapLoaded) { _mapLoaded = true; renderMap(); }
     if (tabBtn.dataset.tab === "home" && !_homeLoaded) { _homeLoaded = true; renderHome(); }
-    if (tabBtn.dataset.tab === "report" && !_reportLoaded) { _reportLoaded = true; loadReport(); }
+    if (tabBtn.dataset.tab === "report") loadReport();
     if (tabBtn.dataset.tab === "dashboard" && !_dashboardLoaded) { _dashboardLoaded = true; renderDashboard(); }
   } else if (nav && nav.classList.contains("open") && !e.target.closest("nav")) {
     nav.classList.remove("open");                    // tap-away closes it too

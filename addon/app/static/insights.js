@@ -11,14 +11,6 @@
   let shown = 8;                       // runs visible before "show more"
   let R = null;
 
-  async function load() {
-    try {
-      const r = await fetch("api/ha/report");
-      R = await r.json();
-    } catch (e) { R = null; }
-    render();
-  }
-
   function _names() {
     const m = {};
     ((R && R.rooms) || []).forEach(r => { if (r.seg != null) m[String(r.seg)] = r.name; });
@@ -100,10 +92,10 @@
     }
   }
 
-  // Load whenever the Report tab is opened (and once at boot for deck reuse).
-  document.addEventListener("click", e => {
-    const b = e.target.closest && e.target.closest('nav button[data-tab="report"]');
-    if (b) load();
+  // Reuse the selected vacuum's report, including its floor-scoped history.
+  document.addEventListener("dreame-room-report", event => {
+    if (!R || R.entry_id !== event.detail.entry_id || R.map !== event.detail.map) shown = 8;
+    R = event.detail;
+    render();
   });
-  setTimeout(load, 1200);
 })();
